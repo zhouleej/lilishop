@@ -1,0 +1,69 @@
+name: Sync upstream source
+
+on:
+  schedule:
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-source-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      UPSTREAM_URL: https://github.com/lilishop/lilishop.git
+      UPSTREAM_BRANCH: ${{ vars.UPSTREAM_BRANCH || 'master' }}
+      GH_TOKEN: ${{ github.token }}
+      GIT_TERMINAL_PROMPT: '0'
+    steps:
+      - name: Update the upstream tracking branch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Allow Git fetches from the public source hosts only.
+          if [[ ! "$UPSTREAM_URL" =~ ^https://(github\.com|gitee\.com)/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.git$ ]]; then
+            echo 'Set UPSTREAM_URL to an HTTPS GitHub or Gitee clone URL ending in .git.' >&2
+            exit 1
+          fi
+          git check-ref-format "refs/heads/$UPSTREAM_BRANCH"
+          target_ref="refs/heads/upstream-sync/$UPSTREAM_BRANCH"
+          target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          mkdir -p "$RUNNER_TEMP/upstream-refs"
+          cd "$RUNNER_TEMP/upstream-refs"
+          git init --bare --quiet
+          git -c http.followRedirects=false fetch --no-tags "$UPSTREAM_URL" \
+            "refs/heads/$UPSTREAM_BRANCH:refs/remotes/source/tracked"
+          new_sha=$(git rev-parse refs/remotes/source/tracked)
+
+          # Scope credentials to the GitHub destination and keep them out of Git config files.
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          export GIT_CONFIG_COUNT=2
+          export GIT_CONFIG_KEY_0="http.$target_url.extraheader"
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth"
+          export GIT_CONFIG_KEY_1=http.followRedirects
+          export GIT_CONFIG_VALUE_1=false
+
+          previous_ref=$(git ls-remote --refs "$target_url" "$target_ref")
+          if [[ -n "$previous_ref" ]]; then
+            git fetch --no-tags "$target_url" "$target_ref:refs/remotes/destination/tracked"
+            old_sha=$(git rev-parse refs/remotes/destination/tracked)
+            if [[ "$old_sha" == "$new_sha" ]]; then
+              printf 'Upstream unchanged at `%s`.\n' "$new_sha" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            if ! git merge-base --is-ancestor "$old_sha" "$new_sha"; then
+              printf 'Refusing a non-fast-forward update of %s (%s → %s).\n' "$target_ref" "$old_sha" "$new_sha" >&2
+              exit 1
+            fi
+          fi
+
+          git push "$target_url" "refs/remotes/source/tracked:$target_ref"
+          printf 'Synced `%s` to `%s` at `%s`.\n' "$UPSTREAM_BRANCH" "$target_ref" "$new_sha" >> "$GITHUB_STEP_SUMMARY"

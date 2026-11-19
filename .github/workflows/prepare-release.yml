@@ -1,0 +1,45 @@
+name: Prepare release draft
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'New version tag, for example dev-v1.0.0'
+        required: true
+      commit:
+        description: 'Full tested commit SHA from master history'
+        required: true
+permissions:
+  contents: write
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+jobs:
+  draft:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ inputs.tag }}
+      SHA: ${{ inputs.commit }}
+    steps:
+      - name: Validate the tested revision and create a draft
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^dev-v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$ ]]
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]
+          status=$(gh api "repos/$GH_REPO/compare/$SHA...master" --jq .status)
+          [[ "$status" == ahead || "$status" == identical ]]
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo 'Release already exists. Inspect its target and status.' >&2
+            exit 1
+          fi
+          existing=$(gh api "repos/$GH_REPO/git/matching-refs/tags/$TAG" --jq '.[] | select(.ref == "refs/tags/" + env.TAG) | .object.sha')
+          if [[ -n "$existing" ]]; then
+            [[ "$existing" == "$SHA" ]]
+          else
+            gh api --method POST "repos/$GH_REPO/git/refs" -f "ref=refs/tags/$TAG" -f "sha=$SHA"
+          fi
+          gh release create "$TAG" --draft --verify-tag --title "$TAG" --notes "Source baseline: $SHA. Add test results, migration steps and rollback notes before publication."
